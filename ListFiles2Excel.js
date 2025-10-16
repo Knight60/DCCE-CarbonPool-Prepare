@@ -1,12 +1,17 @@
-const fs = require('fs').promises; // Use promise-based fs for async/await
+const fs = require('fs').promises;
 const readline = require('readline');
 const path = require('path');
 const { google } = require('googleapis');
 const xl = require('excel4node');
 
 // --- CONFIGURATION ---
-const outName = 'DCCE2023-AiTaxonomy-Output.xlsx'; // Output Excel file name
-const ROOT_FOLDER_ID = '19zRDGONAU5IkTem-z4hvTBJePq57fylV'; // The starting folder ID
+const Year = 2023; // Year for the taxonomy
+const Folders = {
+    2023: '19zRDGONAU5IkTem-z4hvTBJePq57fylV', // Example folder ID for 2023
+    2025: '1ZuWkTpkHmKv4BE7UfU-YMNaOZmFcuLsL', // Example folder ID for 2025
+}
+const outName = 'DCCE' + Year + '-AiTaxonomy-Output.xlsx'; // Output Excel file name
+const ROOT_FOLDER_ID = Folders[Year]; // The starting folder ID
 
 // --- GOOGLE API SETUP ---
 const SCOPES = ['https://www.googleapis.com/auth/drive.metadata.readonly'];
@@ -69,7 +74,7 @@ async function startProcessing(auth) {
     const ws = wb.addWorksheet('FileList');
 
     // Setup Excel Headers
-    const outColumns = ['File Name', 'File ID', 'Folder Path'];
+    const outColumns = ['Folder', 'File', 'Size', 'ID'];
     outColumns.forEach((header, index) => {
         ws.cell(1, index + 1).string(header).style({ font: { bold: true } });
     });
@@ -78,12 +83,11 @@ async function startProcessing(auth) {
 
     console.log(`🚀 Starting to scan Google Drive folder: ${ROOT_FOLDER_ID}`);
 
-    // This object is passed by reference so the function can update the row number
     const context = { ws, currentRow };
 
     await traverseDriveFolder(drive, context, ROOT_FOLDER_ID, '');
 
-    wb.write(outName);
+    await wb.write(outName);
     console.log(`✅ Success! Excel file created: ${outName}`);
 }
 
@@ -99,21 +103,32 @@ async function traverseDriveFolder(drive, context, folderId, currentPath) {
     do {
         const res = await drive.files.list({
             q: `'${folderId}' in parents and trashed = false`,
-            fields: 'nextPageToken, files(id, name, mimeType)',
+            fields: 'nextPageToken, files(id, name, mimeType, size)',
+            orderBy: 'name', // Sorts files and folders alphabetically
             pageToken: pageToken,
-            pageSize: 1000 // Max page size
+            pageSize: 1000,
         });
 
-        for (const file of res.data.files) {
-            const newPath = path.join(currentPath, file.name).replace(/\\/g, '/'); // Consistent path separator
+        const files = res.data.files;
+        if (files && files.length > 0) {
+            // Separate folders and files to process folders first
+            const folders = files.filter(file => file.mimeType === 'application/vnd.google-apps.folder');
+            const imageFiles = files.filter(file => isImageFile(file.mimeType));
 
-            if (file.mimeType === 'application/vnd.google-apps.folder') {
-                console.log(`Entering folder: ${newPath}`);
-                await traverseDriveFolder(drive, context, file.id, currentPath ? path.join(currentPath, file.name).replace(/\\/g, '/') : file.name);
-            } else if (isImageFile(file.mimeType)) {
-                context.ws.cell(context.currentRow, 1).string(file.name);
-                context.ws.cell(context.currentRow, 2).string(file.id);
-                context.ws.cell(context.currentRow, 3).string(currentPath || '/'); // Show '/' for root folder
+            // 1. Recursively process all subfolders first
+            for (const folder of folders) {
+                const newPath = currentPath ? path.join(currentPath, folder.name).replace(/\\/g, '/') : folder.name;
+                console.log(`📂 Entering folder: ${newPath}`);
+                await traverseDriveFolder(drive, context, folder.id, newPath);
+            }
+
+            // 2. Process all files in the current folder
+            for (const file of imageFiles) {
+                // Correctly access 'ws' via the 'context' object
+                context.ws.cell(context.currentRow, 1).string(currentPath || '/');
+                context.ws.cell(context.currentRow, 2).string(file.name);
+                context.ws.cell(context.currentRow, 3).string(file.size);
+                context.ws.cell(context.currentRow, 4).string(file.id);
                 context.currentRow++;
             }
         }
