@@ -10,7 +10,7 @@ const Folders = {
     2023: '19zRDGONAU5IkTem-z4hvTBJePq57fylV', // Example folder ID for 2023
     2025: '1ZuWkTpkHmKv4BE7UfU-YMNaOZmFcuLsL', // Example folder ID for 2025
 }
-const outName = 'DCCE' + Year + '-AiTaxonomy-Output.xlsx'; // Output Excel file name
+const outName = 'DCCE' + Year + '-AiTaxonomy-List.xlsx'; // Output Excel file name
 const ROOT_FOLDER_ID = Folders[Year]; // The starting folder ID
 
 // --- GOOGLE API SETUP ---
