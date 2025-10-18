@@ -9,7 +9,10 @@ const CONFIG = {
     EXCEL_FILE_PATH: './DCCE2025-AiTaxonomy-Sp.xlsx',
     SHEET_NAME: 'AiTaxonomy-2025',
     FILE_ID_COLUMN: 'File ID',
-    FOLDER_ID_COLUMN: 'Folder ID'
+    FOLDER_ID_COLUMN: 'Folder ID',
+    FAILED_ITEMS_OUTPUT_FILE: 'failed_shortcuts_summary.xlsx',
+    MAX_RETRIES: 3, // จำนวนครั้งสูงสุดที่จะลองใหม่
+    RETRY_DELAY_MS: 1000 // เวลาที่รอ (มิลลิวินาที) ก่อนลองครั้งถัดไป
 };
 
 // --- GOOGLE API SETUP ---
@@ -26,14 +29,14 @@ async function main() {
         const credentials = JSON.parse(await fs.readFile(CREDENTIALS_PATH));
         const auth = await authorize(credentials);
         console.log('✅ ยืนยันตัวตนสำเร็จ');
-        await processShortcutsConcurrently(auth); // <== เรียกใช้ฟังก์ชันใหม่
+        await processShortcutsConcurrently(auth);
     } catch (err) {
         console.error('❌ เกิดข้อผิดพลาดร้ายแรงระหว่างการทำงาน:', err.message);
     }
 }
 
 // ==============================================================================
-//  ส่วนของการยืนยันตัวตน (Authentication) - คงไว้เหมือนเดิม
+//  ส่วนของการยืนยันตัวตน (Authentication) - ไม่มีการเปลี่ยนแปลง
 // ==============================================================================
 async function authorize(credentials) {
     const { client_secret, client_id, redirect_uris } = credentials.installed;
@@ -68,52 +71,94 @@ function getNewToken(oAuth2Client) {
 
 
 // ==============================================================================
-//  ส่วนหลักของโปรแกรม (Core Logic) - แก้ไขใหม่เพื่อใช้ Concurrent Requests
+//  ส่วนหลักของโปรแกรม (Core Logic)
 // ==============================================================================
 
 /**
- * สร้าง Shortcut หนึ่งรายการ (เป็นฟังก์ชัน helper)
- * @param {google.drive_v3.Drive} drive The authenticated Drive API client.
- * @param {string} fileId ID ของไฟล์ต้นทาง
- * @param {string} folderId ID ของโฟลเดอร์ปลายทาง
+ * สร้าง Shortcut หนึ่งรายการ (*** แก้ไขแล้ว ***)
  */
 async function createSingleShortcut(drive, fileId, folderId) {
-    // 1. ดึงชื่อของไฟล์ต้นทาง
-    const fileInfo = await drive.files.get({
-        fileId: fileId,
-        fields: 'name'
-    });
-    const originalFileName = fileInfo.data.name;
+    let originalFileName = 'N/A (Failed to fetch name)';
+    try {
+        // 1. ดึงชื่อของไฟล์ต้นทาง (เพิ่ม supportsAllDrives)
+        const fileInfo = await drive.files.get({
+            fileId: fileId,
+            fields: 'name',
+            supportsAllDrives: true // <== เพิ่มบรรทัดนี้
+        });
+        originalFileName = fileInfo.data.name;
 
-    // 2. Metadata สำหรับสร้าง Shortcut
-    const shortcutMetadata = {
-        name: originalFileName,
-        mimeType: 'application/vnd.google-apps.shortcut',
-        shortcutDetails: {
-            targetId: fileId
-        },
-        parents: [folderId]
-    };
+        // 2. Metadata สำหรับสร้าง Shortcut
+        const shortcutMetadata = {
+            name: originalFileName,
+            mimeType: 'application/vnd.google-apps.shortcut',
+            shortcutDetails: { targetId: fileId },
+            parents: [folderId]
+        };
 
-    // 3. เรียก API เพื่อสร้าง Shortcut
-    return drive.files.create({
-        resource: shortcutMetadata,
-        fields: 'id'
-    });
+        // 3. เรียก API เพื่อสร้าง Shortcut (เพิ่ม supportsAllDrives)
+        return await drive.files.create({
+            resource: shortcutMetadata,
+            fields: 'id',
+            supportsAllDrives: true // <== เพิ่มบรรทัดนี้
+        });
+    } catch (error) {
+        const enhancedError = new Error(error.message);
+        enhancedError.fileName = originalFileName;
+        enhancedError.fileId = fileId;
+        throw enhancedError;
+    }
+}
+
+/**
+ * พยายามสร้าง Shortcut พร้อม Retry Logic
+ */
+async function createShortcutWithRetries(drive, fileId, folderId, rowIndex) {
+    for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+        try {
+            return await createSingleShortcut(drive, fileId, folderId);
+        } catch (error) {
+            console.warn(`[แถวที่ ${rowIndex}] ⚠️ พยายามครั้งที่ ${attempt}/${CONFIG.MAX_RETRIES} ล้มเหลว: ${error.message}`);
+            if (attempt === CONFIG.MAX_RETRIES) {
+                console.error(`[แถวที่ ${rowIndex}] ❌ ล้มเหลวถาวรหลังลองครบ ${CONFIG.MAX_RETRIES} ครั้ง`);
+                throw error;
+            }
+            await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+        }
+    }
 }
 
 
 /**
- * อ่านไฟล์ Excel และสร้าง Google Drive shortcuts แบบ Concurrent (พร้อมกันทีละกลุ่ม)
- * @param {google.auth.OAuth2} auth An authorized OAuth2 client.
+ * บันทึกรายการที่ล้มเหลวลงในไฟล์ Excel
+ */
+async function saveFailedItemsToFile(items) {
+    if (items.length === 0) {
+        console.log('🎉 ไม่มีรายการที่ล้มเหลว ไม่จำเป็นต้องสร้างไฟล์สรุป');
+        return;
+    }
+    const filePath = path.join(__dirname, CONFIG.FAILED_ITEMS_OUTPUT_FILE);
+    try {
+        console.log(`\n💾 กำลังบันทึก ${items.length} รายการที่ล้มเหลว...`);
+        const worksheet = XLSX.utils.json_to_sheet(items);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'FailedItems');
+        XLSX.writeFile(workbook, filePath);
+        console.log(`✅ รายการที่ล้มเหลวถูกบันทึกไว้ที่: ${filePath}`);
+    } catch (error) {
+        console.error('❌ เกิดข้อผิดพลาดร้ายแรงขณะบันทึกไฟล์สรุป:', error.message);
+    }
+}
+
+
+/**
+ * อ่านไฟล์ Excel และสร้าง Google Drive shortcuts
  */
 async function processShortcutsConcurrently(auth) {
     const drive = google.drive({ version: 'v3', auth });
-    // การส่ง request พร้อมกันเยอะเกินไปอาจเจอปัญหา Rate Limit ของ Google
-    // แนะนำให้เริ่มจากค่าน้อยๆ เช่น 20-50 แล้วค่อยๆ ปรับเพิ่ม
     const CHUNK_SIZE = 100;
     let successCount = 0;
-    let errorCount = 0;
+    const failedItems = [];
 
     try {
         console.log(`\n📖 กำลังอ่านไฟล์ Excel: ${CONFIG.EXCEL_FILE_PATH}`);
@@ -127,52 +172,60 @@ async function processShortcutsConcurrently(auth) {
         for (let i = 3550; i < data.length; i += CHUNK_SIZE) {
             const chunk = data.slice(i, i + CHUNK_SIZE);
             const currentChunkNum = Math.floor(i / CHUNK_SIZE) + 1;
-            const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
+            const totalChunks = Math.ceil((data.length - 3550) / CHUNK_SIZE);
 
-            console.log(`\n🔄 กำลังประมวลผลกลุ่มที่ ${currentChunkNum} / ${totalChunks} (แถวที่ ${i + 1} ถึง ${i + chunk.length}) จาก ${data.length}`);
+            console.log(`\n🔄 กำลังประมวลผลกลุ่มที่ ${currentChunkNum} / ${totalChunks} (แถวที่ ${i + 2} ถึง ${i + 1 + chunk.length})`);
 
-            // สร้าง Array ของ Promises สำหรับทุกรายการใน chunk นี้
             const promises = chunk.map((row, index) => {
-                const rowIndexForLog = i + index + 2; // +2 เพื่อให้ตรงกับเลขแถวใน Excel
+                const rowIndexForLog = i + index + 2;
                 const fileId = row[CONFIG.FILE_ID_COLUMN];
                 const folderId = row[CONFIG.FOLDER_ID_COLUMN];
 
                 if (!fileId || !folderId) {
-                    console.warn(`[แถวที่ ${rowIndexForLog}] ⚠️ ข้อมูลไม่ครบ ข้าม...`);
-                    // คืนค่า Promise ที่ reject ทันทีเพื่อให้นับเป็น error
-                    return Promise.reject(new Error(`Missing File ID or Folder ID at row ${rowIndexForLog}`));
+                    const reason = `ข้อมูล File ID หรือ Folder ID ไม่ครบ`;
+                    return Promise.reject({
+                        message: reason,
+                        fileName: 'N/A (Missing data)',
+                        fileId: fileId || 'N/A',
+                        rowIndex: rowIndexForLog
+                    });
                 }
 
-                return createSingleShortcut(drive, fileId, folderId);
+                return createShortcutWithRetries(drive, fileId, folderId, rowIndexForLog);
             });
 
-            // รอให้ทุก Promises ใน chunk นี้ทำงานเสร็จสิ้น (ไม่ว่าจะสำเร็จหรือล้มเหลว)
             const results = await Promise.allSettled(promises);
 
-            // ตรวจสอบผลลัพธ์
             results.forEach((result, index) => {
                 const rowIndexForLog = i + index + 2;
+                const row = chunk[index];
                 if (result.status === 'fulfilled') {
                     successCount++;
-                    // console.log(`[แถวที่ ${rowIndexForLog}] ✅ สำเร็จ`);
                 } else {
-                    errorCount++;
-                    // แสดงเฉพาะ error ที่เกิดขึ้นจริงจากการเรียก API
-                    if (result.reason.message.includes('Missing') === false) {
-                        console.error(`[แถวที่ ${rowIndexForLog}] ❌ ล้มเหลว: ${result.reason.message}`);
-                    }
+                    const reason = result.reason;
+                    failedItems.push({
+                        'File Name': reason.fileName || 'N/A',
+                        'File ID': reason.fileId || row[CONFIG.FILE_ID_COLUMN] || 'N/A',
+                        'Row in Excel': rowIndexForLog,
+                        'Error Message': reason.message
+                    });
                 }
             });
-            console.log(`👍 กลุ่มที่ ${currentChunkNum} ประมวลผลเสร็จสิ้น (สำเร็จ: ${results.filter(r => r.status === 'fulfilled').length}, ผิดพลาด: ${results.filter(r => r.status === 'rejected').length})`);
+            const chunkSuccess = results.filter(r => r.status === 'fulfilled').length;
+            const chunkFailed = results.filter(r => r.status === 'rejected').length;
+            console.log(`👍 กลุ่มที่ ${currentChunkNum} เสร็จสิ้น (สำเร็จ: ${chunkSuccess}, ผิดพลาด: ${chunkFailed})`);
         }
 
         console.log('\n========================================');
-        console.log('✨ การทำงานเสร็จสิ้น ✨');
+        console.log('✨ การทำงานทั้งหมดเสร็จสิ้น ✨');
         console.log(`- สร้าง Shortcut สำเร็จ: ${successCount} รายการ`);
-        console.log(`- เกิดข้อผิดพลาด/ข้ามไป: ${errorCount} รายการ`);
+        console.log(`- เกิดข้อผิดพลาด/ข้ามไป: ${failedItems.length} รายการ`);
         console.log('========================================');
+
+        await saveFailedItemsToFile(failedItems);
 
     } catch (error) {
         console.error('❌ เกิดข้อผิดพลาดในฟังก์ชัน processShortcutsConcurrently:', error.message);
+        await saveFailedItemsToFile(failedItems);
     }
 }
